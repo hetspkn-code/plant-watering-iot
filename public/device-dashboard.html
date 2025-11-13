@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Device Dashboard</title>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; background: #f7f8fb; color: #222; }
+    .card { background:#fff; padding:16px;border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.06); max-width:900px; margin:auto; }
+    h2 { margin-top:0; }
+    #chart { height:240px; }
+    .controls { margin-top:12px; }
+    button { padding:8px 12px; border-radius:6px; border:none; background:#1976d2; color:#fff; cursor:pointer; }
+    .muted { color:#666; font-size:14px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Device Dashboard</h2>
+    <div id="meta" class="muted"></div>
+    <canvas id="chart"></canvas>
+    <div class="controls">
+      Latest: <span id="latest">--</span>
+      &nbsp;&nbsp; Status: <span id="status">Waiting</span>
+    </div>
+    <hr />
+    <div>
+      <strong>Link Telegram:</strong>
+      <p class="muted">Open your Telegram app and send the following message to the bot to receive alerts:</p>
+      <pre id="linkCmd" style="background:#f1f1f1;padding:8px;border-radius:6px;">/link &lt;deviceId&gt;</pre>
+      <button onclick="copyCmd()">Copy command</button>
+    </div>
+  </div>
+
+<script>
+  const socket = io();
+  const deviceId = window.location.pathname.split('/').pop();
+  document.getElementById('meta').innerText = 'Device: ' + deviceId;
+
+  socket.emit('join-device', deviceId);
+
+  const ctx = document.getElementById('chart').getContext('2d');
+  let labels = [], data = [];
+  const chart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [{ label: 'Gas value', data, fill:false, tension:0.3, pointRadius:0 }] },
+    options: { responsive:true, scales: { y: { beginAtZero:true } } }
+  });
+
+  function pushPoint(v, ts) {
+    labels.push(new Date(ts).toLocaleTimeString());
+    data.push(v);
+    if (labels.length > 60) { labels.shift(); data.shift(); }
+    chart.update();
+    document.getElementById('latest').innerText = v;
+    document.getElementById('status').innerHTML = (v >= 400) ? '⚠️ High' : '✅ Normal';
+  }
+
+  // fetch recent readings
+  fetch('/api/gas?deviceId=' + deviceId + '&limit=60')
+    .then(r=>r.json())
+    .then(list => list.reverse().forEach(it => pushPoint(it.value, it.timestamp)))
+    .catch(err => console.error(err));
+
+  // live updates from Socket.IO
+  socket.on('new-reading', payload => {
+    if (payload.deviceId === deviceId) pushPoint(payload.value, payload.timestamp);
+  });
+
+  document.getElementById('linkCmd').innerText = '/link ' + deviceId;
+  function copyCmd() {
+    navigator.clipboard.writeText('/link ' + deviceId);
+    alert('Command copied. Open Telegram and send it to the bot.');
+  }
+</script>
+</body>
+</html>
