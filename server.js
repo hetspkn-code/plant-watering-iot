@@ -90,7 +90,7 @@ const bodyParser = require('body-parser');
 const TelegramBot = require('node-telegram-bot-api');
 
 const Device = require('./models/Device');
-const GasReading = require('./models/GasReading');
+const GasReading = require('./models/Reading');
 
 const app = express();
 const server = http.createServer(app);
