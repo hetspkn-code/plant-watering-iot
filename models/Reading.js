@@ -1,3 +1,4 @@
+// models/GasReading.js
 const mongoose = require('mongoose');
 
 const gasSchema = new mongoose.Schema({
@@ -6,4 +7,4 @@ const gasSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now }
 });
 
-module.exports = mongoose.model('Reading', gasSchema);
+module.exports = mongoose.model('GasReading', gasSchema);
