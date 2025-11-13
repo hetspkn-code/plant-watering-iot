@@ -1,172 +1,351 @@
-// server.js -- Plant watering server (Express + Mongoose + Socket.IO)
+// // server.js
+// require('dotenv').config();
+// const express = require('express');
+// const mongoose = require('mongoose');
+// const cors = require('cors');
+// const http = require('http');
+// const { Server } = require('socket.io');
+// const TelegramBot = require('node-telegram-bot-api');
+
+// const GasReading = require('./models/GasReading');
+
+// const app = express();
+// const server = http.createServer(app);
+// const io = new Server(server);
+
+// app.use(cors());
+// app.use(express.json());
+// app.use(express.static('public'));
+
+// const PORT = process.env.PORT || 3000;
+// const MONGO_URL = process.env.MONGO_URL;
+// const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+// const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+// const ALERT_THRESHOLD = Number(process.env.ALERT_THRESHOLD || 400);
+
+// // Telegram bot (optional)
+// let bot = null;
+// if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+//   // We don't need polling because we only send messages from the server.
+//   bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
+//   console.log('Telegram bot configured.');
+// } else {
+//   console.log('Telegram not configured — will skip alerts.');
+// }
+
+// // Connect to MongoDB
+// mongoose.connect(MONGO_URL, {
+//   useNewUrlParser: true,
+//   useUnifiedTopology: true
+// }).then(() => console.log('MongoDB connected')).catch(err => console.error('MongoDB error', err));
+
+// // API: receive reading from ESP8266 (POST JSON { value })
+// app.post('/api/gas', async (req, res) => {
+//   try {
+//     const { value } = req.body;
+//     if (typeof value !== 'number') return res.status(400).json({ error: 'value required (number)' });
+
+//     const reading = await GasReading.create({ value });
+
+//     // emit to dashboard clients via socket.io
+//     io.emit('new-reading', { value: reading.value, timestamp: reading.timestamp });
+
+//     // check threshold and send telegram alert
+//     if (value >= ALERT_THRESHOLD && bot) {
+//       const text = `⚠️ *Gas Alert*\nValue: ${value}\nTime: ${new Date(reading.timestamp).toLocaleString()}`;
+//       bot.sendMessage(TELEGRAM_CHAT_ID, text, { parse_mode: 'Markdown' }).catch(err => console.error('Telegram send error', err));
+//     }
+
+//     res.json({ ok: true });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ error: 'server error' });
+//   }
+// });
+
+// // API: get recent readings
+// app.get('/api/gas', async (req, res) => {
+//   const limit = Number(req.query.limit || 50);
+//   const readings = await GasReading.find().sort({ timestamp: -1 }).limit(limit);
+//   res.json(readings);
+// });
+
+// // Socket connection logging
+// io.on('connection', socket => {
+//   console.log('Dashboard client connected', socket.id);
+//   socket.on('disconnect', () => console.log('Dashboard client disconnected', socket.id));
+// });
+
+// server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+
+// server.js
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
-const crypto = require('crypto');
-const path = require('path');
+const bodyParser = require('body-parser');
+const TelegramBot = require('node-telegram-bot-api');
 
-const Device = require('./models/Device');      // reuse/modify as below
-const Reading = require('./models/Reading'); // use as generic Reading
+const Device = require('./models/Device');
+const GasReading = require('./models/GasReading');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-const PORT = process.env.PORT || 3000;
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/plant-watering';
-
 app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(bodyParser.json());
+app.use(express.static('public'));
 
-// connect to mongo
-mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+const PORT = process.env.PORT || 3000;
+const MONGO_URL = process.env.MONGO_URL;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const GLOBAL_ALERT_THRESHOLD = Number(process.env.ALERT_THRESHOLD || 400);
+
+// Connect to MongoDB
+mongoose.connect(MONGO_URL, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(()=> console.log('MongoDB connected'))
-  .catch(err => console.error('MongoDB connection error:', err));
+  .catch(err => { console.error('MongoDB connect error', err); process.exit(1); });
 
-// Utility: generate apiKey
-function genKey() {
-  return crypto.randomBytes(18).toString('hex');
+// Telegram bot (polling) - required to let users /link <deviceId>
+let bot = null;
+if (TELEGRAM_BOT_TOKEN) {
+  bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+  console.log('Telegram bot active (polling).');
+  // Bot command: /link <deviceId>  -> store chatId to device
+  bot.onText(/\/link (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id.toString();
+    const deviceId = match[1].trim();
+    try {
+      const device = await Device.findOne({ deviceId });
+      if (!device) {
+        bot.sendMessage(chatId, `❌ Device ${deviceId} not found.`);
+        return;
+      }
+      device.telegramChatId = chatId;
+      await device.save();
+      bot.sendMessage(chatId, `✅ Device ${deviceId} linked. You will receive alerts for this device.`);
+    } catch (err) {
+      console.error('Telegram /link error', err);
+    }
+  });
+} else {
+  console.log('No TELEGRAM_BOT_TOKEN configured - Telegram features disabled.');
 }
 
+// Socket.IO: clients can join rooms for deviceId to receive live updates
+io.on('connection', socket => {
+  console.log('Socket connected', socket.id);
+  socket.on('join-device', (deviceId) => {
+    socket.join(deviceId);
+    console.log(`Socket ${socket.id} joined room ${deviceId}`);
+  });
+  socket.on('leave-device', (deviceId) => {
+    socket.leave(deviceId);
+  });
+  socket.on('disconnect', () => {
+    // console.log('Socket disconnected', socket.id);
+  });
+});
+
 /**
- * Device registration
  * POST /api/register
- * body: { deviceId, deviceName? }
- * returns: { deviceId, apiKey, deviceName }
- * If device exists returns existing apiKey.
+ * Body: { deviceName: string }
+ * Returns: { deviceId, apiKey, dashboardUrl }
+ *
+ * This is called by the ESP after first Wi-Fi connection.
  */
 app.post('/api/register', async (req, res) => {
   try {
-    const { deviceId, deviceName } = req.body;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-    let device = await Device.findOne({ deviceId });
-    if (!device) {
-      device = new Device({
-        deviceId,
-        apiKey: genKey(),
-        deviceName: deviceName || deviceId,
-        alertThreshold: 500, // default soil threshold (you can change)
-        alertActive: false
-      });
-      await device.save();
-    }
-    return res.json({ deviceId: device.deviceId, apiKey: device.apiKey, deviceName: device.deviceName });
+    const { deviceName } = req.body;
+    // create unique deviceId and apiKey
+    const deviceId = (Date.now().toString(36) + Math.random().toString(36).slice(2,8));
+    const apiKey = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+
+    const device = new Device({ deviceId, apiKey, deviceName });
+    await device.save();
+
+    const dashboardUrl = `${req.protocol}://${req.get('host')}/dashboard/${deviceId}`;
+    res.json({ deviceId, apiKey, dashboardUrl });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'server error' });
+    console.error('Register error', err);
+    res.status(500).json({ error: 'server error' });
   }
 });
 
 /**
- * Device posts a reading
- * POST /api/readings
- * body: { deviceId, apiKey, soilValue, pumpState? }
- * server saves reading and returns control instruction (pump: "on"|"off"|"none")
+ * POST /api/gas
+ * Receives readings from devices. Requires deviceId and apiKey in body OR x-api-key header + deviceId in body.
+ * Body: { deviceId, value, apiKey? }
  */
-app.post('/api/readings', async (req, res) => {
+// app.post('/api/gas', async (req, res) => {
+//   try {
+//     const { deviceId, value } = req.body;
+//     let apiKey = req.body.apiKey || req.headers['x-api-key'];
+
+//     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+//     if (typeof value === 'undefined') return res.status(400).json({ error: 'value required' });
+
+//     const device = await Device.findOne({ deviceId });
+//     if (!device) return res.status(401).json({ error: 'Invalid device' });
+
+//     if (!apiKey || apiKey !== device.apiKey) {
+//       return res.status(401).json({ error: 'Unauthorized: invalid apiKey' });
+//     }
+
+//     const reading = new GasReading({ deviceId, value });
+//     await reading.save();
+
+//     // emit to Socket.IO room for this device
+//     io.to(deviceId).emit('new-reading', { deviceId, value: reading.value, timestamp: reading.timestamp });
+
+//     // decide threshold: device-specific if set, otherwise global
+//     const threshold = (device.alertThreshold != null) ? device.alertThreshold : GLOBAL_ALERT_THRESHOLD;
+//     if (value >= threshold) {
+//       // send Telegram alert to linked chat (if present)
+//       if (bot && device.telegramChatId) {
+//         const text = `⚠️ *Gas Alert*\nDevice: ${device.deviceName || device.deviceId}\nValue: ${value}\nTime: ${new Date(reading.timestamp).toLocaleString()}`;
+//         bot.sendMessage(device.telegramChatId, text, { parse_mode: 'Markdown' }).catch(e => console.error('Telegram send error', e));
+//       }
+//     }
+
+//     res.status(201).json({ success: true });
+//   } catch (err) {
+//     console.error('API gas error', err);
+//     res.status(500).json({ error: 'server error' });
+//   }
+// });
+
+app.post('/api/gas', async (req, res) => {
   try {
-    const { deviceId, apiKey, soilValue, pumpState } = req.body;
-    if (!deviceId || typeof soilValue === 'undefined') return res.status(400).json({ error: 'deviceId and soilValue required' });
+    const { deviceId, value } = req.body;
+    const apiKey = req.body.apiKey || req.headers['x-api-key'];
+
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    if (typeof value === 'undefined') return res.status(400).json({ error: 'value required' });
 
     const device = await Device.findOne({ deviceId });
-    if (!device) return res.status(401).json({ error: 'Unknown device' });
-    if (!apiKey || apiKey !== device.apiKey) return res.status(401).json({ error: 'Invalid apiKey' });
+    if (!device) return res.status(401).json({ error: 'Invalid device' });
 
-    const reading = new Reading({ deviceId, value: soilValue });
+    if (!apiKey || apiKey !== device.apiKey)
+      return res.status(401).json({ error: 'Unauthorized: invalid apiKey' });
+
+    // Save the reading
+    const reading = new GasReading({ deviceId, value });
     await reading.save();
 
-    // update device lastValue/pump state
-    device.lastValue = soilValue;
-    if (typeof pumpState !== 'undefined') device.alertActive = !!pumpState;
+    // Notify connected dashboards
+    io.to(deviceId).emit('new-reading', {
+      deviceId,
+      value,
+      timestamp: reading.timestamp,
+    });
+
+    // Determine threshold
+    const threshold =
+      device.alertThreshold != null
+        ? device.alertThreshold
+        : GLOBAL_ALERT_THRESHOLD;
+
+    const wasActive = device.alertActive;
+    const nowActive = value >= threshold;
+
+    // Update device record
+    device.lastValue = value;
+    device.alertActive = nowActive;
     await device.save();
 
-    // emit live update for dashboards
-    io.to(deviceId).emit('new-reading', { deviceId, soilValue, timestamp: reading.timestamp });
-
-    // Decide control: simple hysteresis using device.alertThreshold, and optional device fields
-    // If soilValue < dry -> turn pump ON. If soilValue > wet threshold -> turn OFF.
-    const dryThreshold = device.alertThreshold ?? 500;       // default
-    const wetThreshold = device.wetThreshold ?? (dryThreshold + 120);
-
-    let action = "none";
-    // If device requested manual override (alertActive used as pumpState), prefer it:
-    if (device.forcedPump === 'on') action = 'on';
-    else if (device.forcedPump === 'off') action = 'off';
-    else {
-      // automatic
-      if (soilValue < dryThreshold) action = 'on';
-      else if (soilValue > wetThreshold) action = 'off';
-      else action = 'none';
+    // 🚨 Alert just triggered
+    if (!wasActive && nowActive) {
+      console.log(`🚨 Gas leak detected for ${deviceId} (${value})`);
+      if (bot && device.telegramChatId) {
+        const text = `🚨 *Gas Alert*\nDevice: ${
+          device.deviceName || device.deviceId
+        }\nValue: ${value}\nTime: ${new Date(reading.timestamp).toLocaleString()}`;
+        bot
+          .sendMessage(device.telegramChatId, text, { parse_mode: 'Markdown' })
+          .catch((e) => console.error('Telegram send error', e));
+      }
     }
 
-    return res.json({ success: true, action, dryThreshold, wetThreshold });
+    // ✅ Alert resolved
+    else if (wasActive && !nowActive) {
+      console.log(`✅ Gas level back to normal for ${deviceId} (${value})`);
+      if (bot && device.telegramChatId) {
+        const text = `✅ *Gas Normal*\nDevice: ${
+          device.deviceName || device.deviceId
+        }\nValue: ${value}\nTime: ${new Date(reading.timestamp).toLocaleString()}`;
+        bot
+          .sendMessage(device.telegramChatId, text, { parse_mode: 'Markdown' })
+          .catch((e) => console.error('Telegram send error', e));
+      }
+    }
+
+    res.status(201).json({ success: true });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'server error' });
+    console.error('API gas error', err);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+
+/**
+ * GET /api/gas?deviceId=...&limit=..
+ * Get recent readings for a device.
+ * NOTE: this endpoint is intentionally simple: possession of the deviceId grants access to the dashboard.
+ * If you need stronger security, protect this endpoint with tokens or login.
+ */
+app.get('/api/gas', async (req, res) => {
+  try {
+    const deviceId = req.query.deviceId;
+    const limit = Math.min(200, Number(req.query.limit) || 50);
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const readings = await GasReading.find({ deviceId }).sort({ timestamp: -1 }).limit(limit);
+    res.json(readings);
+  } catch (err) {
+    console.error('GET /api/gas error', err);
+    res.status(500).json({ error: 'server error' });
   }
 });
 
 /**
- * Dashboard control APIs (simple)
- * POST /api/device/:deviceId/force  { apiKey, action: "on"|"off"|"auto" }
- * GET  /api/device/:deviceId        { apiKey } returns device info
+ * POST /api/link-telegram
+ * Link a telegram chat to a device programmatically (optional).
+ * Body: { deviceId, chatId, apiKey }
+ * The device's apiKey is required to authorize linking
  */
-app.post('/api/device/:deviceId/force', async (req, res) => {
+app.post('/api/link-telegram', async (req, res) => {
   try {
-    const { deviceId } = req.params;
-    const { apiKey, action } = req.body;
+    const { deviceId, chatId, apiKey } = req.body;
+    if (!deviceId || !chatId || !apiKey) return res.status(400).json({ error: 'deviceId, chatId, apiKey required' });
+
     const device = await Device.findOne({ deviceId });
     if (!device) return res.status(404).json({ error: 'device not found' });
-    if (!apiKey || apiKey !== device.apiKey) return res.status(401).json({ error: 'invalid apiKey' });
+    if (device.apiKey !== apiKey) return res.status(401).json({ error: 'unauthorized' });
 
-    if (action === 'on' || action === 'off') {
-      device.forcedPump = action;
-    } else {
-      device.forcedPump = null; // go back to auto
-    }
+    device.telegramChatId = chatId.toString();
     await device.save();
-    io.to(deviceId).emit('device-update', { deviceId, forcedPump: device.forcedPump });
-    return res.json({ success: true, forcedPump: device.forcedPump });
+    res.json({ success: true });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'server error' });
-  }
-});
-
-app.get('/api/device/:deviceId', async (req, res) => {
-  try {
-    const device = await Device.findOne({ deviceId: req.params.deviceId });
-    if (!device) return res.status(404).json({ error: 'not found' });
-    return res.json(device);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'server error' });
+    console.error('/api/link-telegram error', err);
+    res.status(500).json({ error: 'server error' });
   }
 });
 
 /**
- * Serve the dashboard page (you can open /dashboard/<deviceId>)
+ * Serve the per-device dashboard page
  */
 app.get('/dashboard/:deviceId', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'device-dashboard.html'));
+  res.sendFile(__dirname + '/public/device-dashboard.html');
 });
 
+// simple index (optional)
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  res.sendFile(__dirname + '/public/index.html');
 });
 
-// Socket.IO: allow dashboard clients to join a room for a device
-io.on('connection', socket => {
-  console.log('client connected', socket.id);
-  socket.on('join', deviceId => {
-    socket.join(deviceId);
-    console.log('socket joined room', deviceId);
-  });
-  socket.on('disconnect', () => console.log('client disconnected', socket.id));
-});
-
-server.listen(PORT, () => console.log(`Server running on ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
