@@ -255,6 +255,36 @@ app.post('/api/link-telegram', async (req, res) => {
   }
 });
 
+////////////////////
+app.post("/api/device/:id/command", async (req, res) => {
+  try {
+    const deviceId = req.params.id;
+    const { command } = req.body;
+
+    if (!command) {
+      return res.status(400).json({ error: "Missing 'command' field" });
+    }
+
+    // Validate allowed commands
+    const allowed = ["PUMP_ON", "PUMP_OFF"];
+    if (!allowed.includes(command)) {
+      return res.status(400).json({ error: "Invalid command" });
+    }
+
+    // Store the command for the ESP to fetch later
+    deviceCommands[deviceId] = { command, timestamp: Date.now() };
+
+    console.log(`📡 Command stored for ${deviceId}: ${command}`);
+    return res.json({ success: true, message: `Command '${command}' sent to device ${deviceId}` });
+
+  } catch (err) {
+    console.error("Error in POST /command:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+
+
 /**
  * Serve the per-device dashboard page
  */
